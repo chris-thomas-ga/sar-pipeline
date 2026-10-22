@@ -105,24 +105,18 @@ def generate_s1_iw_scene_completeness_report_cli(
     """
     Generate a scene completeness report for normalised radar backscatter (nrb) products.
 
-    NOTE - The following only considers scenes that have been processed, and not
-    individual burst products. For a detailed report, the cli make_burst_product_completeness_report_cli
-    should be used.
+    NOTE - The following reports the scenes to reprocess, and does not check the products in
+    AWS S3, linked static layers or duplicates. For a detailed report, the cli
+    make_burst_product_completeness_report_cli should be used.
 
-    First, the CDSE is queried for scene_ids within the provided time range and geometry to get
-    an expected list of processed scenes. Next, the function will search the monitoring folder
-    for the scene tracking files that get uploaded with every run to:
-            - {s3_project_folder}/monitoring/processed_scenes/{scene}.json.
+    First, the CDSE is queried for the burst products within the provided time range and geometry
+    to get the expected burst products, and the scenes they belong to. Next, the open data cube (odc)
+    is queried via the stac-api for the burst products that have been processed and indexed.
 
-    The list of scenes in this folder is then compared to the list of expected scenes, resulting
-    in a list of scenes that have not been processed in the expected time-range. These scenes
-    should be re-sent for processing.
-
-    However, if the processed_scenes monitoring folder is empty, a warning is raised and the function
-    falls back to querying the the open data cube (odc) via the stac-api to determine the processed
-    scenes associated with the burst products. We can then determine if any of the expected scenes are
-    missing from the odc (i.e. have no associated burst products). This process is much slower than
-    checking the monitoring folder and may not be suitable for large timeframes.
+    A scene is only considered processed if every one of its expected burst products is indexed.
+    Scenes with any missing burst products should be re-sent for processing. The process will fail
+    if any CDSE query fails or is truncated, rather than report an incomplete list of expected products.
+    Querying the stac-api may be slow for large time windows.
 
     A completeness report (.json) is created detailing the missing scenes that need reprocessing.
     This report should be monitored by another process.

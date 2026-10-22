@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 import logging
 from pathlib import Path
 import os
-from shapely.geometry import shape, Polygon, MultiPolygon
+from shapely.geometry import shape, box, Polygon, MultiPolygon
 from pystac_client.exceptions import APIError
 from tqdm import tqdm
 import time
@@ -35,6 +35,11 @@ from sar_pipeline.pipelines.isce3_rtc.metadata.odc import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# Minutes of acquisitions per CDSE burst query. A query that reaches the 1000
+# result limit is split and re-queried, so this only trades off the number of
+# requests against the number of splits.
+CDSE_CHUNK_QUERY_MINUTES = 60
 
 COMPLETENESS_REPORT_FORMAT = (
     "{report_dt}_{start_dt}_{end_dt}_{report_type}_completeness_report.json"
@@ -79,6 +84,20 @@ def _make_completeness_report_json_safe(obj):
 
     else:
         return obj
+
+
+def _expand_geometry_for_product_search(
+    geometry: Polygon | MultiPolygon, buffer_degrees: float = 0.5
+) -> Polygon | MultiPolygon:
+    """Expected bursts come from the CDSE, which includes a burst if its burst
+    footprint intersects the ROI. The GA STAC items use the valid data footprint,
+    which is slightly smaller, so bursts on the edge of the ROI are not returned by a
+    STAC search using the ROI itself, and would be reported as missing. Buffer the
+    ROI (clipped to valid coordinates) for the product search. Additional products
+    returned are ignored as they are not expected."""
+    return geometry.buffer(buffer_degrees, quad_segs=2).intersection(
+        box(-180, -90, 180, 90)
+    )
 
 
 @log_timing
@@ -127,132 +146,90 @@ def make_scene_completeness_report(
 
     geometry = load_geojson_as_multipolygon(roi_geojson)
 
-    logging.info("Query the CDSE STAC API for expected processed scene metadata")
-
-    # stac query STAC for items with slight buffer in times
-    n_stac_matches, stac_items = query_stac_for_metadata_in_period(
+    # Get the burst products we expect to have over the time period. This is the
+    # same expected set as the burst level report, so a scene is only counted as
+    # processed if every one of its expected bursts has been processed.
+    logging.info("Querying the CDSE for expected burst products")
+    expected_burst_product_dict = query_cdse_for_bursts_in_period(
         start_dt=start_dt,
         end_dt=end_dt,
-        geometry=shape(geometry),
-        collections=["sentinel-1-slc"],
-        query={"sar:instrument_mode": {"eq": "IW"}},
-        fields={"include": ["id"]},
-        stac_catalog="https://stac.dataspace.copernicus.eu/v1/",
+        chunk_query_minutes=CDSE_CHUNK_QUERY_MINUTES,
+        geometry=geometry,
+        query_overlap_seconds=10,
+        product_type="IW_SLC__1S",
+        max_workers=10,
     )
 
-    if n_stac_matches == None:
-        logging.info(f"Total number of matches not provided.")
-    else:
-        logging.info(
-            f"{n_stac_matches} scenes found for the given time/geometry window."
-        )
-
-    logger.info("Iterating stac results. This may take a while for large requests...")
-
-    # get the list of scenes we expect to have been processed based on the bursts
-    expected_scene_set = {item["id"] for item in stac_items.items_as_dicts()}
+    expected_scene_set = {v["scene_id"] for v in expected_burst_product_dict.values()}
 
     logging.info(
-        f"{len(expected_scene_set)} processed scenes expected to be found for burst products"
+        f"{len(expected_burst_product_dict)} burst products expected from "
+        f"{len(expected_scene_set)} scenes"
     )
 
-    # get the scenes that have been processed using the processed tracking file
-    # this is a simple .json file that gets created after processing every scene
-    # produced for sar-pipeline>v0.4.0
-    processed_scene_s3_monitoring_folder = (
-        f"{s3_project_folder}/monitoring/processed_scenes"
+    # get the burst products that have been processed and indexed
+    logging.info(
+        f"Querying the STAC API for processed burst products : {stac_catalog}. "
+        "This may be slow for large time windows"
     )
-    processed_scenes_set = set()
+    buffer = timedelta(minutes=1)
+    n_stac_matches, stac_items = query_stac_for_metadata_in_period(
+        start_dt=start_dt - buffer,
+        end_dt=end_dt + buffer,
+        geometry=_expand_geometry_for_product_search(geometry),
+        collections=collections_to_search,
+        stac_catalog=stac_catalog,
+        fields={"include": ["id", "properties.sarard:burst_id", "properties.datetime"]},
+    )
 
     logging.info(
-        f"Searching the monitoring folder for processed scenes : {processed_scene_s3_monitoring_folder}"
+        f"{n_stac_matches} burst products found for the given time/geometry window.."
     )
 
-    # query the folder for the filenames (scene.json)
-    s3_utility = S3Util(unsigned=True)
-    paginator = s3_utility.s3.get_paginator("list_objects_v2")
-    found_any_objects = False
+    processed_burst_set = set()
+    retries = 0
+    max_retries = 1
+    while True:
+        try:
+            for item in tqdm(
+                stac_items.items_as_dicts(),
+                total=n_stac_matches,
+                desc="Iterating STAC items",
+            ):
+                burst_id = item["properties"]["sarard:burst_id"]
+                azimuth_time = datetime.strptime(
+                    item["properties"]["datetime"], "%Y-%m-%dT%H:%M:%S.%fZ"
+                )
+                processed_burst_set.add((burst_id, azimuth_time))
+            break  # success
+        except APIError as e:
+            retries += 1
+            if retries > max_retries:
+                logging.error(f"Max retries reached for finding bursts on GA STAC API")
+                raise e
+            logging.warning(f"STAC API error: {e}. Retrying in 10s...")
+            time.sleep(10)
 
-    for page in paginator.paginate(
-        Bucket=s3_bucket,
-        Prefix=processed_scene_s3_monitoring_folder,
-    ):
-        contents = page.get("Contents", [])
-        if contents:
-            found_any_objects = True
-
-        for obj in contents:
-            key = obj["Key"]
-            if key.endswith(".json"):
-                # add the scene_id
-                processed_scenes_set.add(Path(key).stem)
-
-    logging.info(
-        f"{len(processed_scenes_set)} total processed scenes found for all locations and time"
-    )
-
-    # raise warning if folder is empty or does not exist
-    if not found_any_objects:
-        logger.warning(
-            f"No objects found under s3://{s3_bucket}/"
-            f"{processed_scene_s3_monitoring_folder}. "
-            "Ensure that processed scenes are saved to this location in the isce3_rtc pipeline."
-        )
-
-        logger.warning(
-            "Falling back to querying the STAC API for processed scenes. "
-            "This is much slower and may not be appropriate for large time windows"
-        )
-
-        # query for bursts in the period and filter for scenes
-        # this will happen for products made with sar-pipeline<=v0.4.0
-        buffer = timedelta(minutes=1)
-        n_stac_matches, stac_items = query_stac_for_metadata_in_period(
-            start_dt=start_dt - buffer,
-            end_dt=end_dt + buffer,
-            geometry=shape(geometry),
-            collections=collections_to_search,
-            stac_catalog=stac_catalog,
-            fields={"include": ["id", "properties.sarard:scene_id"]},
-            # fields={"include": ["id", "properties.scene_id"]},
-        )
-
-        logging.info(
-            f"{n_stac_matches} burst products found for the given time/geometry window.."
-        )
-        logging.info(f"Getting list of parent scenes processed")
-
-        retries = 0
-        max_retries = 1
-        while True:
-            try:
-                for item in tqdm(
-                    stac_items.items_as_dicts(),
-                    total=n_stac_matches,
-                    desc="Iterating STAC items",
-                ):
-                    processed_scenes_set.add(item["properties"]["sarard:scene_id"])
-                break  # success
-            except APIError as e:
-                retries += 1
-                if retries > max_retries:
-                    logging.error(
-                        f"Max retries reached for finding scenes on GA STAC API"
-                    )
-                    raise e
-                logging.warning(f"STAC API error: {e}. Retrying in 10s...")
-                time.sleep(10)
-
-    # reconcile which scenes do not exist / are missing and should therefore be reprocessed
-    logger.info("Comparing list of processed scenes to expected scenes")
-    existing_scene_set = expected_scene_set & processed_scenes_set
-    missing_scene_set = expected_scene_set - processed_scenes_set
+    # reconcile which bursts are missing. Any scene with a missing burst should be reprocessed
+    logger.info("Comparing processed burst products to expected burst products")
+    missing_bursts_by_scene = {}
+    for key, burst_info in expected_burst_product_dict.items():
+        if key not in processed_burst_set:
+            missing_bursts_by_scene.setdefault(burst_info["scene_id"], []).append(
+                burst_info["burst_id"]
+            )
+    missing_scene_set = set(missing_bursts_by_scene)
+    n_missing_bursts = sum(len(v) for v in missing_bursts_by_scene.values())
 
     logging.info(
-        f"{len(existing_scene_set)} of {len(expected_scene_set)} expected scenes have existing products."
+        f"{n_missing_bursts} of {len(expected_burst_product_dict)} expected burst products are missing."
     )
     logging.info(
-        f"{len(missing_scene_set)} of {len(expected_scene_set)} expected scenes are missing. "
+        f"{len(expected_scene_set) - len(missing_scene_set)} of {len(expected_scene_set)} "
+        "expected scenes have all burst products."
+    )
+    logging.info(
+        f"{len(missing_scene_set)} of {len(expected_scene_set)} expected scenes are missing burst products. "
         "For a detailed assessment of the specific burst products that need to be "
         "reprocessed or re-indexed run the burst level completeness check."
     )
@@ -274,12 +251,16 @@ def make_scene_completeness_report(
         "summary": {
             "n_expected_processed_scenes": len(expected_scene_set),
             "n_scenes_to_reprocess": len(missing_scene_set),
+            "n_expected_burst_products": len(expected_burst_product_dict),
+            "n_burst_products_missing_from_odc": n_missing_bursts,
         },
         "results_descriptions": {
-            "scenes_to_reprocess": "These are scenes that could not be found indexed in the open data cube (ODC). The simple assumption is made that these need to be reprocessed and indexed.",
+            "scenes_to_reprocess": "These are scenes with at least one expected burst product that could not be found indexed in the open data cube (ODC). The simple assumption is made that these need to be reprocessed and indexed.",
+            "burst_products_missing_by_scene": "The burst ids of the expected burst products missing from the ODC for each scene to reprocess.",
         },
         "results": {
-            "scenes_to_reprocess": list(missing_scene_set),
+            "scenes_to_reprocess": sorted(missing_scene_set),
+            "burst_products_missing_by_scene": missing_bursts_by_scene,
         },
     }
 
@@ -367,7 +348,7 @@ def make_burst_product_completeness_report(
     expected_burst_product_dict = query_cdse_for_bursts_in_period(
         start_dt=start_dt,
         end_dt=end_dt,
-        chunk_query_minutes=5,
+        chunk_query_minutes=CDSE_CHUNK_QUERY_MINUTES,
         geometry=geometry,
         query_overlap_seconds=10,
         product_type="IW_SLC__1S",
@@ -483,7 +464,7 @@ def make_burst_product_completeness_report(
         n_stac_matches, stac_items = query_stac_for_metadata_in_period(
             start_dt=start_dt - buffer,
             end_dt=end_dt + buffer,
-            geometry=shape(geometry),
+            geometry=_expand_geometry_for_product_search(geometry),
             collections=collections_to_search,
             stac_catalog=stac_catalog,
         )

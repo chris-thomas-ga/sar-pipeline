@@ -5,6 +5,7 @@ import shapely
 from shapely.geometry import Polygon, MultiPolygon
 from typing import Optional, Literal
 import sys
+import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -24,6 +25,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 ValidBurstProducts = Literal["IW_SLC__1S", "EW_SLC__1S"]
+
+# the CDSE odata API returns at most this many results for a single request
+CDSE_ODATA_MAX_RESULTS = 1000
+# status codes for CDSE requests that are worth retrying
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+class CDSEQueryTruncatedError(Exception):
+    """A CDSE request returned the maximum number of results, so some may be missing."""
+
+
+class CDSEQueryFailedError(Exception):
+    """One or more CDSE requests failed, so the set of expected bursts is incomplete."""
 
 
 def get_burst_info_for_scene_from_asf(
@@ -445,28 +459,57 @@ def ensure_static_layers_in_s3(
         sys.exit(early_exit_code)
 
 
+def _get_cdse_request_with_retries(
+    url: str,
+    max_retries: int = 5,
+    timeout: int = 120,
+) -> dict:
+    """GET a CDSE odata url, retrying on connection errors, timeouts and
+    retryable status codes (429/5xx). Other errors are raised immediately,
+    and the last error is raised once the retries are used up."""
+    for attempt in range(max_retries + 1):
+        try:
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.HTTPError,
+        ) as err:
+            response = getattr(err, "response", None)
+            if (
+                isinstance(err, requests.exceptions.HTTPError)
+                and response is not None
+                and response.status_code not in RETRYABLE_STATUS_CODES
+            ):
+                raise
+            if attempt == max_retries:
+                raise
+            wait_seconds = min(2**attempt * 5, 120)
+            logger.warning(
+                f"CDSE request failed (attempt {attempt + 1} of {max_retries + 1}) : {err}. "
+                f"Retrying in {wait_seconds}s"
+            )
+            time.sleep(wait_seconds)
+
+
 def _make_chunk_cdse_request(
     base_url: str,
     chunk_start: datetime,
     chunk_end: datetime,
     product_type: ValidBurstProducts,
     geometry: Optional[Polygon | MultiPolygon],
+    min_split_seconds: int = 10,
 ):
-    """Execute a single GET request for one time chunk."""
-    chunk_start = format_dt_utc(chunk_start)
-    chunk_end = format_dt_utc(chunk_end)
-
-    base_query = (
-        f"$filter=ContentDate/Start ge {chunk_start} "
-        f"and ContentDate/Start le {chunk_end} "
-        f"and ParentProductType eq '{product_type}'"
-    )
-
-    all_results = []
+    """Execute the GET request/s for one time chunk. One request is made per polygon
+    in the geometry. If a request returns the maximum number of results, the time
+    range is split in half and re-queried, so no bursts are silently missed.
+    Raises CDSEQueryTruncatedError if a range shorter than `min_split_seconds`
+    still returns the maximum."""
 
     if geometry:
         if isinstance(geometry, MultiPolygon):
-            # Create one OData filter per polygon, then join with ' or '
             polygons_filters = [
                 f" and OData.CSC.Intersects(area=geography'SRID=4326;{poly.wkt}')"
                 for poly in geometry.geoms
@@ -477,13 +520,40 @@ def _make_chunk_cdse_request(
             ]
         else:
             raise TypeError("Provided geometry must be Polygon or Multipolygon")
+    else:
+        polygons_filters = [""]
 
-    for poly_wkt in polygons_filters:
-        query = base_query + poly_wkt + "&$orderby=ContentDate/Start desc&$top=1000"
-        url = f"{base_url}?{query}"
-        r = requests.get(url)
-        r.raise_for_status()
-        all_results.extend(r.json().get("value", []))
+    def _query(poly_filter: str, query_start: datetime, query_end: datetime):
+        query = (
+            f"$filter=ContentDate/Start ge {format_dt_utc(query_start)} "
+            f"and ContentDate/Start le {format_dt_utc(query_end)} "
+            f"and ParentProductType eq '{product_type}'"
+            + poly_filter
+            + f"&$orderby=ContentDate/Start desc&$top={CDSE_ODATA_MAX_RESULTS}"
+        )
+        results = _get_cdse_request_with_retries(f"{base_url}?{query}").get("value", [])
+        if len(results) < CDSE_ODATA_MAX_RESULTS:
+            return results
+        if query_end - query_start <= timedelta(seconds=min_split_seconds):
+            raise CDSEQueryTruncatedError(
+                f"CDSE returned the maximum of {CDSE_ODATA_MAX_RESULTS} results for "
+                f"{format_dt_utc(query_start)} → {format_dt_utc(query_end)}, so some "
+                "bursts may be missing."
+            )
+        # split the range in half. Both ends are inclusive, so bursts on the
+        # midpoint are returned twice and de-duplicated by the caller
+        mid = query_start + (query_end - query_start) / 2
+        logger.info(
+            f"CDSE returned the maximum of {CDSE_ODATA_MAX_RESULTS} results for "
+            f"{format_dt_utc(query_start)} → {format_dt_utc(query_end)}. Splitting the query."
+        )
+        return _query(poly_filter, query_start, mid) + _query(
+            poly_filter, mid, query_end
+        )
+
+    all_results = []
+    for poly_filter in polygons_filters:
+        all_results.extend(_query(poly_filter, chunk_start, chunk_end))
 
     return all_results
 
@@ -538,6 +608,12 @@ def query_cdse_for_bursts_in_period(
             "platform": str,
         }
 
+    Raises
+    ------
+    CDSEQueryFailedError
+        If any chunk query fails after retries, or still returns the maximum number
+        of results after splitting (i.e. was truncated). The returned bursts are used as the expected
+        products in completeness reports, so a partial result would hide gaps.
     """
 
     logging.info(f"Querying CDSE for bursts between : {start_dt} and {end_dt}")
@@ -578,6 +654,7 @@ def query_cdse_for_bursts_in_period(
     )
 
     burst_product_dict = {}
+    failed_chunks = []
 
     # -------- Parallel requests --------
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -600,16 +677,14 @@ def query_cdse_for_bursts_in_period(
             try:
                 results = fut.result()
             except Exception as err:
-                logging.error(f"Chunk {query_end_dt} → {query_start_dt} failed: {err}")
+                # keep going so all failures are reported, then raise below.
+                # A skipped chunk would otherwise have no expected bursts and
+                # look complete.
+                logging.error(f"Chunk {query_start_dt} → {query_end_dt} failed: {err}")
+                failed_chunks.append((query_start_dt, query_end_dt, err))
                 continue
 
             # Process results
-            if len(results) > 1000:
-                logging.info(
-                    "WARNING - more than the limit of 1000 results were found for the query."
-                    f" Reduce `chunk_query_minutes` to be less than the current value of "
-                    f" {chunk_query_minutes} as some bursts may be missed"
-                )
             for b in results:
                 track_number = int(b.get("RelativeOrbitNumber"))
                 esa_burst_id = int(b.get("BurstId"))
@@ -634,6 +709,16 @@ def query_cdse_for_bursts_in_period(
                         "azimuth_time": az_time,
                         "platform": b.get("PlatformSerialIdentifier"),
                     }
+
+    if failed_chunks:
+        failed_info = "\n".join(
+            f" {chunk_start} → {chunk_end} : {err}"
+            for chunk_start, chunk_end, err in sorted(failed_chunks, key=lambda x: x[0])
+        )
+        raise CDSEQueryFailedError(
+            f"{len(failed_chunks)} of {len(futures)} CDSE chunk queries failed, so the "
+            f"list of expected bursts is incomplete. Failed chunks:\n{failed_info}"
+        )
 
     if not burst_product_dict:
         logging.info("No bursts found for the given time/geometry window.")
